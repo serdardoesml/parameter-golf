@@ -628,8 +628,10 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, bias=True)
+        self.attn_norm_2 = RMSNorm(dim, bias=True)
         self.mlp_norm = RMSNorm(dim, bias=True)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale_2 = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
@@ -638,6 +640,8 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        attn_out = attn(self.attn_norm_2(x))
+        x = x + self.attn_scale_2.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(self.mlp_norm(x))
         return x
 
