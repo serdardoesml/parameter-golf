@@ -63,7 +63,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layer_schedule = {
         int(k): int(v)
-        for item in os.environ.get("NUM_LAYER_SCHEDULE", "0:1,200:2,400:4").split(",")
+        for item in os.environ.get("NUM_LAYER_SCHEDULE", "0:1,600:4").split(",")
         if item.strip()
         for k, v in [item.split(":", 1)]
     }
@@ -834,6 +834,9 @@ def main() -> None:
     schedule_changes_num_layers = len(set(schedule_layers)) > 1
     current_schedule_idx = 0
 
+    def use_find_unused_parameters(schedule_idx: int) -> bool:
+        return schedule_changes_num_layers and schedule_idx + 1 < len(schedule_steps)
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=max_num_layers,
@@ -989,12 +992,14 @@ def main() -> None:
         zero_grad_all()
         base_model.active_num_layers = schedule_layers[current_schedule_idx]
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    ddp_find_unused_parameters = use_find_unused_parameters(current_schedule_idx)
     model: nn.Module = (
         DDP(
             compiled_model,
             device_ids=[local_rank],
             broadcast_buffers=False,
-            find_unused_parameters=schedule_changes_num_layers,
+            find_unused_parameters=ddp_find_unused_parameters,
         )
         if distributed
         else compiled_model
@@ -1014,11 +1019,26 @@ def main() -> None:
     step = 0
     while True:
         while current_schedule_idx + 1 < len(schedule_steps) and step >= schedule_steps[current_schedule_idx + 1]:
+            torch.cuda.synchronize()
+            chunk_ms = 1000.0 * (time.perf_counter() - t0)
+            training_time_ms += chunk_ms
+            phase_training_time_ms += chunk_ms
             current_schedule_idx += 1
             base_model.active_num_layers = schedule_layers[current_schedule_idx]
             phase_training_time_ms = 0.0
             phase_start_step = step
             log0(f"layer_schedule_advance:step:{step} active_num_layers:{base_model.active_num_layers}")
+            next_ddp_find_unused_parameters = use_find_unused_parameters(current_schedule_idx)
+            if distributed and next_ddp_find_unused_parameters != ddp_find_unused_parameters:
+                ddp_find_unused_parameters = next_ddp_find_unused_parameters
+                model = DDP(
+                    compiled_model,
+                    device_ids=[local_rank],
+                    broadcast_buffers=False,
+                    find_unused_parameters=ddp_find_unused_parameters,
+                )
+                model.train()
+            t0 = time.perf_counter()
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
