@@ -48,9 +48,6 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    num_layer_schedule = [
-        int(x) for x in os.environ.get("NUM_LAYER_SCHEDULE", "").split(",") if x.strip()
-    ]
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -64,6 +61,12 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    num_layer_schedule = {
+        int(k): int(v)
+        for item in os.environ.get("NUM_LAYER_SCHEDULE", "0:1,200:2,400:4").split(",")
+        if item.strip()
+        for k, v in [item.split(":", 1)]
+    }
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 16))
@@ -818,13 +821,18 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    num_layer_schedule = args.num_layer_schedule or [1, 2, 4]
-    max_num_layers = max(num_layer_schedule)
-    if any(num_layers <= 0 or num_layers > max_num_layers for num_layers in num_layer_schedule):
-        raise ValueError(
-            f"NUM_LAYER_SCHEDULE entries must be positive, got {num_layer_schedule}"
-        )
-    num_layer_schedule_idx = 0
+    num_layer_schedule = dict(sorted(args.num_layer_schedule.items()))
+    if not num_layer_schedule:
+        raise ValueError("NUM_LAYER_SCHEDULE must not be empty")
+    if 0 not in num_layer_schedule:
+        raise ValueError(f"NUM_LAYER_SCHEDULE must include step 0, got {num_layer_schedule}")
+    if any(step < 0 or num_layers <= 0 for step, num_layers in num_layer_schedule.items()):
+        raise ValueError(f"NUM_LAYER_SCHEDULE entries must be nonnegative steps with positive depths, got {num_layer_schedule}")
+    schedule_steps = list(num_layer_schedule)
+    schedule_layers = list(num_layer_schedule.values())
+    max_num_layers = max(schedule_layers)
+    schedule_changes_num_layers = len(set(schedule_layers)) > 1
+    current_schedule_idx = 0
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -839,14 +847,19 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    base_model.active_num_layers = num_layer_schedule[num_layer_schedule_idx]
+    base_model.active_num_layers = schedule_layers[current_schedule_idx]
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
+        DDP(
+            compiled_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=schedule_changes_num_layers,
+        )
         if distributed
         else compiled_model
     )
@@ -935,7 +948,8 @@ def main() -> None:
     compile_x = torch.zeros((local_train_batch_size, args.train_seq_len), device=device, dtype=torch.int64)
     compile_y = torch.zeros((local_train_batch_size, args.train_seq_len), device=device, dtype=torch.int64)
 
-    def prime_depth_compile() -> None:
+    def prime_depth_compile(num_layers: int) -> None:
+        base_model.active_num_layers = num_layers
         compiled_model.train()
         zero_grad_all()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -946,15 +960,15 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    def lr_mul(step: int, elapsed_ms: float) -> float:
+    def lr_mul(step: int, global_elapsed_ms: float, phase_elapsed_ms: float, phase_steps: int) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
+        step_ms = phase_elapsed_ms / max(phase_steps, 1)
         warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        remaining_ms = max(max_wallclock_ms - global_elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
@@ -962,6 +976,9 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        for num_layers in dict.fromkeys(schedule_layers):
+            prime_depth_compile(num_layers)
+        base_model.active_num_layers = schedule_layers[current_schedule_idx]
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -981,6 +998,7 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        base_model.active_num_layers = schedule_layers[current_schedule_idx]
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -990,23 +1008,33 @@ def main() -> None:
     # -----------------------------
 
     training_time_ms = 0.0
+    phase_training_time_ms = 0.0
+    phase_start_step = 0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
     while True:
+        while current_schedule_idx + 1 < len(schedule_steps) and step >= schedule_steps[current_schedule_idx + 1]:
+            current_schedule_idx += 1
+            base_model.active_num_layers = schedule_layers[current_schedule_idx]
+            phase_training_time_ms = 0.0
+            phase_start_step = step
+            log0(f"layer_schedule_advance:step:{step} active_num_layers:{base_model.active_num_layers}")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            chunk_ms = 1000.0 * (time.perf_counter() - t0)
+            training_time_ms += chunk_ms
+            phase_training_time_ms += chunk_ms
             if last_step:
-                base_model.active_num_layers = num_layer_schedule[-1]
+                base_model.active_num_layers = schedule_layers[-1]
             val_loss, val_bpb = eval_val(
                 args,
-                model,
+                base_model,
                 rank,
                 world_size,
                 device,
@@ -1016,18 +1044,12 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            phase_steps = max(step - phase_start_step, 1)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{phase_training_time_ms / phase_steps:.2f}ms"
             )
-            compiled_model.train()
-            if step > 0 and not last_step and num_layer_schedule_idx + 1 < len(num_layer_schedule):
-                num_layer_schedule_idx += 1
-                base_model.active_num_layers = num_layer_schedule[num_layer_schedule_idx]
-                log0(f"layer_schedule_advance:step:{step} active_num_layers:{base_model.active_num_layers}")
-                prime_depth_compile()
-            else:
-                torch.cuda.synchronize()
+            torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
@@ -1038,8 +1060,11 @@ def main() -> None:
                 )
             break
 
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
+        chunk_ms = 1000.0 * (time.perf_counter() - t0)
+        global_elapsed_ms = training_time_ms + chunk_ms
+        phase_elapsed_ms = phase_training_time_ms + chunk_ms
+        phase_steps = max(step - phase_start_step, 1)
+        scale = lr_mul(step, global_elapsed_ms, phase_elapsed_ms, phase_steps)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1068,7 +1093,10 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        chunk_ms = 1000.0 * (time.perf_counter() - t0)
+        approx_training_time_ms = training_time_ms + chunk_ms
+        approx_phase_training_time_ms = phase_training_time_ms + chunk_ms
+        phase_steps = max(step - phase_start_step, 1)
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1076,7 +1104,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_phase_training_time_ms / phase_steps:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1135,7 +1163,7 @@ def main() -> None:
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        base_model,
         rank,
         world_size,
         device,
