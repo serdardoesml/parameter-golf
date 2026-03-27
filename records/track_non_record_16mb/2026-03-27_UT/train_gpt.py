@@ -840,7 +840,11 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = [
+        (name, p)
+        for name, p in base_model.named_parameters()
+        if name != "skip_weights" and not name.startswith("tok_emb.") and not name.startswith("lm_head.")
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
