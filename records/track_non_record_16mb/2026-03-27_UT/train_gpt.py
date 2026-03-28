@@ -63,14 +63,14 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layer_schedule = {
         int(k): int(v)
-        for item in os.environ.get("NUM_LAYER_SCHEDULE", "0:2,1000:6").split(",")
+        for item in os.environ.get("NUM_LAYER_SCHEDULE", "0:2,1600:6").split(",")
         if item.strip()
         for k, v in [item.split(":", 1)]
     }
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 640))
     num_heads = int(os.environ.get("NUM_HEADS", 16))
-    mlp_mult = int(os.environ.get("MLP_MULT", 16))
+    mlp_mult = int(os.environ.get("MLP_MULT", 18))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
