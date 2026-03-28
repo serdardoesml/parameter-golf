@@ -518,8 +518,20 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        weight = self.weight
+        if self.training and getattr(self, "_noisy_qat_int8", False):
+            # Noisy QAT for recurrent/shared weights adapted from the DepthRecurrence_MixedPrecisionQuant non-record submission by aruniyer.
+            with torch.no_grad():
+                step_size = weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+            weight = weight + (torch.rand_like(weight) - 0.5) * step_size.to(dtype=weight.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, weight.to(x.dtype), bias)
+
+
+def enable_noisy_qat_int8(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, CastedLinear):
+            submodule._noisy_qat_int8 = True
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -684,6 +696,9 @@ class GPT(nn.Module):
         self.shared_attn = CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.shared_attn_2 = CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.shared_mlp = MLP(model_dim, mlp_mult)
+        enable_noisy_qat_int8(self.shared_attn)
+        enable_noisy_qat_int8(self.shared_attn_2)
+        enable_noisy_qat_int8(self.shared_mlp)
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim)
