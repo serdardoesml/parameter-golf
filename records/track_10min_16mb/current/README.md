@@ -1,6 +1,6 @@
 # Current Experiment: 2x Attention Blocks
 
-Starting from the 2026-04-09 record, this editable copy tests replacing each standard `attention + MLP` block with `attention + attention + MLP` while keeping the large matrix parameter budget roughly flat. The second attention module is added per block, and default `MLP_MULT` is reduced from `4.0` to `2.5`.
+Starting from the 2026-04-09 record, this editable copy tests adding a second attention sublayer only to the recurrent physical layers. Current defaults use `NUM_LAYERS=10`, `MLP_MULT=4.0`, and loop layers 4-5 three total times (`NUM_LOOPS=2`, `LOOP_START=4`, `LOOP_END=5`). The second attention path has its own learned residual scale vector.
 
 # Base Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
 
