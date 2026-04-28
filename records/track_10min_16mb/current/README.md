@@ -1,6 +1,6 @@
 # Current Experiment: 2x Attention Blocks
 
-Starting from the 2026-04-09 record, this editable copy tests adding a second attention sublayer only to the recurrent physical layers. Current defaults use `NUM_LAYERS=11`, `MLP_MULT=4.0`, remove the MLP from block 0, and loop layers 5-6 three total times (`NUM_LOOPS=2`, `LOOP_START=5`, `LOOP_END=6`). The second attention path has its own learned residual scale vector.
+Starting from the 2026-04-09 record, this editable copy tests adding a second attention sublayer only to the recurrent physical layers. Current defaults use `NUM_LAYERS=12`, `MLP_MULT=4.0`, remove the MLP from blocks 0 and 7, and loop layers 5-6 three total times (`NUM_LOOPS=2`, `LOOP_START=5`, `LOOP_END=6`). The second attention path has its own learned residual scale vector.
 
 # Base Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
 
