@@ -247,7 +247,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 4.5))
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
@@ -1133,9 +1133,10 @@ class Block(nn.Module):
             max_seqlen=max_seqlen,
         )
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
-            None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        if up_w is not None:
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
+                None, None, :
+            ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
 
 class GPT(nn.Module):
@@ -1154,8 +1155,8 @@ class GPT(nn.Module):
         hidden_dim = int(h.mlp_mult * h.model_dim)
         self.qo_bank = nn.Parameter(torch.empty(2 * h.num_layers, h.model_dim, h.model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * h.num_layers, kv_dim, h.model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(h.num_layers, hidden_dim, h.model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(h.num_layers, h.model_dim, hidden_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(h.num_layers - 1, hidden_dim, h.model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(h.num_layers - 1, h.model_dim, hidden_dim))
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList(
@@ -1262,7 +1263,7 @@ class GPT(nn.Module):
             self.qo_bank.data[n + i].mul_(proj_scale)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)
-        for i in range(n):
+        for i in range(n - 1):
             nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)
             nn.init.zeros_(self.mlp_down_bank.data[i])
             self.mlp_down_bank.data[i].mul_(proj_scale)
@@ -1284,8 +1285,8 @@ class GPT(nn.Module):
             self.kv_bank[i],
             self.kv_bank[n + i],
             self.qo_bank[n + i],
-            self.mlp_up_bank[i],
-            self.mlp_down_bank[i],
+            None if i == 0 else self.mlp_up_bank[i - 1],
+            None if i == 0 else self.mlp_down_bank[i - 1],
         )
 
     def _parallel_block(
@@ -1303,9 +1304,11 @@ class GPT(nn.Module):
         )
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
-        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
-            block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
-        )
+        mlp_out = torch.zeros_like(lane1)
+        if up_w is not None:
+            mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
+                block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
+            )
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
@@ -1558,11 +1561,12 @@ class GPT(nn.Module):
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
-        mlp_out = block.mlp(mlp_n, up_w, down_w)
-        if lora.mlp_loras is not None:
-            mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        if up_w is not None:
+            mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
+            mlp_out = block.mlp(mlp_n, up_w, down_w)
+            if lora.mlp_loras is not None:
+                mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
+            x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
     def _parallel_block_with_lora(
@@ -1618,12 +1622,14 @@ class GPT(nn.Module):
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        mlp_read = lane1
-        mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
-        mlp_out = block.mlp(mlp_n, up_w, down_w)
-        if lora.mlp_loras is not None:
-            mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+        mlp_out = torch.zeros_like(lane1)
+        if up_w is not None:
+            mlp_read = lane1
+            mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
+            mlp_out = block.mlp(mlp_n, up_w, down_w)
+            if lora.mlp_loras is not None:
+                mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
+            mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
@@ -2095,7 +2101,8 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
 
     for i, block in enumerate(model.blocks):
         hooks.append(block.attn.register_forward_hook(make_attn_hook(i)))
-        hooks.append(block.mlp.register_forward_hook(make_mlp_hook(i)))
+        if i > 0:
+            hooks.append(block.mlp.register_forward_hook(make_mlp_hook(i)))
 
     # Hessian hooks for embedding factorization projection layers
     def make_linear_input_hook(weight_name):
@@ -2541,6 +2548,8 @@ def _deserialize_pergroup(blob, num_layers, tmpdir):
 
         if group_key.startswith("_"):
             tensor_names = [group_key[1:]]
+        elif group_key in ("mlp.fc.weight.q", "mlp.proj.weight.q"):
+            tensor_names = [f"blocks.{i}.{group_key}" for i in range(1, num_layers)]
         else:
             tensor_names = [f"blocks.{i}.{group_key}" for i in range(num_layers)]
 
@@ -2584,11 +2593,11 @@ def _unbank_state_dict(state_dict, num_layers):
                 sd[f"blocks.{i}.attn.c_k.weight"] = t[i]
                 sd[f"blocks.{i}.attn.c_v.weight"] = t[n + i]
         elif k == "mlp_up_bank":
-            for i in range(n):
-                sd[f"blocks.{i}.mlp.fc.weight"] = t[i]
+            for i in range(1, n):
+                sd[f"blocks.{i}.mlp.fc.weight"] = t[i - 1]
         elif k == "mlp_down_bank":
-            for i in range(n):
-                sd[f"blocks.{i}.mlp.proj.weight"] = t[i]
+            for i in range(1, n):
+                sd[f"blocks.{i}.mlp.proj.weight"] = t[i - 1]
         else:
             if t is not None:
                 sd[k] = t
@@ -2605,11 +2614,11 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
         sd["qo_bank"][n + i] = flat_sd[f"blocks.{i}.attn.proj.weight"]
         sd["kv_bank"][i] = flat_sd[f"blocks.{i}.attn.c_k.weight"]
         sd["kv_bank"][n + i] = flat_sd[f"blocks.{i}.attn.c_v.weight"]
-    sd["mlp_up_bank"] = torch.zeros(n, hidden_dim, model_dim)
-    sd["mlp_down_bank"] = torch.zeros(n, model_dim, hidden_dim)
-    for i in range(n):
-        sd["mlp_up_bank"][i] = flat_sd[f"blocks.{i}.mlp.fc.weight"]
-        sd["mlp_down_bank"][i] = flat_sd[f"blocks.{i}.mlp.proj.weight"]
+    sd["mlp_up_bank"] = torch.zeros(n - 1, hidden_dim, model_dim)
+    sd["mlp_down_bank"] = torch.zeros(n - 1, model_dim, hidden_dim)
+    for i in range(1, n):
+        sd["mlp_up_bank"][i - 1] = flat_sd[f"blocks.{i}.mlp.fc.weight"]
+        sd["mlp_down_bank"][i - 1] = flat_sd[f"blocks.{i}.mlp.proj.weight"]
     for k, v in flat_sd.items():
         if not (
             k.startswith("blocks.")
