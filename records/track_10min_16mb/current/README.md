@@ -1,6 +1,6 @@
-# Current Experiment: 2x Attention Blocks
+# Current Experiment: Shared Attention
 
-Starting from the 2026-04-09 record, this editable copy tests running two attention sublayers in every block while sharing the same two attention modules across all blocks. Current defaults use `NUM_LAYERS=11`, `MLP_MULT=5.0`, all blocks keep their MLP, and loop layers 5-6 three total times (`NUM_LOOPS=2`, `LOOP_START=5`, `LOOP_END=6`). Each physical block keeps its own norms, post-norm attention biases, residual scale vectors, MLP, and residual mix; only the two attention weight sets are global/shared.
+Starting from the 2026-04-09 record, this editable copy tests using one attention module shared across all blocks. Current defaults use `NUM_LAYERS=11`, `MLP_MULT=5.25`, all blocks keep their MLP, and loop layers 5-6 three total times (`NUM_LOOPS=2`, `LOOP_START=5`, `LOOP_END=6`). Each physical block keeps its own norm, post-norm attention bias, residual scale vector, MLP, and residual mix; only the attention weights are global/shared.
 
 # Base Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
 
