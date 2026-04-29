@@ -1,6 +1,6 @@
-# Current Experiment: Shared Attention
+# Current Experiment: Loop Norm Independence
 
-Starting from the 2026-04-09 record, this editable copy tests using one attention module shared across all blocks. Current defaults use `NUM_LAYERS=11`, `MLP_MULT=5.25`, all blocks keep their MLP, and loop layers 5-6 three total times (`NUM_LOOPS=2`, `LOOP_START=5`, `LOOP_END=6`). Each physical block keeps its own norm, post-norm attention bias, residual scale vector, MLP, and residual mix; only the attention weights are global/shared.
+Editable uncompressed copy of the 2026-04-09 record. The only architecture change is that virtual calls of the recurrent loop segment get independent attention/MLP RMSNorm modules plus learned post-norm bias vectors; the attention and MLP weights remain shared through the original physical blocks.
 
 # Base Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
 
